@@ -301,20 +301,20 @@ class C2f(nn.Module):
         """
         super().__init__()
         self.c = int(c2 * e)  # hidden channels
-        self.cv1 = Conv(c1, 2 * self.c, 1, 1)
-        self.cv2 = Conv((2 + n) * self.c, c2, 1)  # optional act=FReLU(c2)
+        self.cv1a = Conv(c1, self.c, 1, 1)
+        self.cv1b = Conv(c1, self.c, 1, 1)  # optional act=FReLU(c2)
+        self.cv2 = Conv((2+n) * self.c, c2, 1)
         self.m = nn.ModuleList(Bottleneck(self.c, self.c, shortcut, g, k=((3, 3), (3, 3)), e=1.0) for _ in range(n))
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Forward pass through C2f layer."""
-        y = list(self.cv1(x).chunk(2, 1))
-        y.extend(m(y[-1]) for m in self.m)
-        return self.cv2(torch.cat(y, 1))
+    def forward(self, x):
+       y = [self.cv1a(x), self.cv1b(x)] #two separate convolutions in place of chunk
+       y.extend(m(y[-1]) for m in self.m)
+       return self.cv2(torch.cat(y,1))
+             #forward pass dpu
 
     def forward_split(self, x: torch.Tensor) -> torch.Tensor:
         """Forward pass using split() instead of chunk()."""
-        y = self.cv1(x).split((self.c, self.c), 1)
-        y = [y[0], y[1]]
+        y = [self.cv1a(x), self.cv1b(x)]
         y.extend(m(y[-1]) for m in self.m)
         return self.cv2(torch.cat(y, 1))
 
