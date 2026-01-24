@@ -290,7 +290,6 @@ class C2f(nn.Module):
 
     def __init__(self, c1: int, c2: int, n: int = 1, shortcut: bool = False, g: int = 1, e: float = 0.5):
         """Initialize a CSP bottleneck with 2 convolutions.
-
         Args:
             c1 (int): Input channels.
             c2 (int): Output channels.
@@ -298,20 +297,20 @@ class C2f(nn.Module):
             shortcut (bool): Whether to use shortcut connections.
             g (int): Groups for convolutions.
             e (float): Expansion ratio.
-        """
+        """      
         super().__init__()
-        self.c = int(c2 * e)  # hidden channels
-        self.cv1a = Conv(c1, self.c, 1, 1)
-        self.cv1b = Conv(c1, self.c, 1, 1)  # optional act=FReLU(c2)
-        self.cv2 = Conv((2+n) * self.c, c2, 1)
-        self.m = nn.ModuleList(Bottleneck(self.c, self.c, shortcut, g, k=((3, 3), (3, 3)), e=1.0) for _ in range(n))
+        self.c = int(c2 * e) # hidden channels
+        self.cv1a = Conv(c1, self.c, 1, 1)  #first branch - new
+        self.cv1b = Conv(c1, self.c, 1, 1)  #second branch - new 
+        self.cv2 = Conv((2 + n) * self.c, c2, 1)    # optional act = FReLU(c2)
+        self.m = nn.ModuleList(Bottleneck(self.c, self.c, shortcut, g, k = ((3,3), (3,3)), e=1.0) for _ in range(n))
 
     def forward(self, x):
        y = [self.cv1a(x), self.cv1b(x)] #two separate convolutions in place of chunk
        y.extend(m(y[-1]) for m in self.m)
        return self.cv2(torch.cat(y,1))
              #forward pass dpu
-
+        
     def forward_split(self, x: torch.Tensor) -> torch.Tensor:
         """Forward pass using split() instead of chunk()."""
         y = [self.cv1a(x), self.cv1b(x)]
@@ -1268,6 +1267,55 @@ class C2fCIB(C2f):
         self.m = nn.ModuleList(CIB(self.c, self.c, shortcut, e=1.0, lk=lk) for _ in range(n))
 
 
+class DPUAttention(nn.Module):
+    """DPU-compatible attention using large kernel depthwise convolutions.
+    
+    Replaces self-attention (Q@K@V) with spatial attention via:
+    - Depthwise conv for local context (5x5)
+    - Dilated depthwise conv for global context (7x7, dilation=3 → 19x19 effective RF)
+    - Pointwise conv for channel mixing
+    - Hardsigmoid gating
+    
+    All ops are DPU-compatible: depthwiseconv2d, conv2d, eltwise prod.
+    """
+
+    def __init__(self, dim, num_heads=8, attn_ratio=0.5):
+        super().__init__()
+        # Keep signature compatible with original Attention
+        # num_heads and attn_ratio ignored but kept for API compatibility
+        
+        # Local context: 5x5 depthwise conv
+        self.dw_local = Conv(dim, dim, 5, g=dim, act=False)
+        
+        # Global context: 7x7 dilated depthwise conv (effective 19x19 receptive field)
+        self.dw_global = nn.Conv2d(dim, dim, 7, padding=9, dilation=3, groups=dim, bias=False)
+        self.bn = nn.BatchNorm2d(dim)
+        
+        # Channel mixing: 1x1 pointwise conv
+        self.pw = Conv(dim, dim, 1, act=False)
+        
+        # Gating activation (DPU-supported)
+        self.act = nn.Hardsigmoid()
+        
+        # Positional encoding (keep from original)
+        self.pe = Conv(dim, dim, 3, 1, g=dim, act=False)
+
+    def forward(self, x):
+        # Compute attention weights via large kernel convs
+        attn = self.dw_local(x)
+        attn = self.bn(self.dw_global(attn))
+        attn = self.pw(attn)
+        attn = self.act(attn)
+        
+        # Apply attention (eltwise prod - DPU supported)
+        out = x * attn
+        
+        # Add positional encoding
+        out = out + self.pe(x)
+        
+        return out
+
+
 class Attention(nn.Module):
     """Attention module that performs self-attention on the input tensor.
 
@@ -1322,7 +1370,8 @@ class Attention(nn.Module):
         )
 
         attn = (q.transpose(-2, -1) @ k) * self.scale
-        attn = attn.softmax(dim=-1)
+        #attn = attn.softmax(dim=-1)
+        attn = F.hardsigmoid(attn)
         x = (v @ attn.transpose(-2, -1)).view(B, C, H, W) + self.pe(v.reshape(B, C, H, W))
         x = self.proj(x)
         return x
@@ -1360,7 +1409,7 @@ class PSABlock(nn.Module):
         """
         super().__init__()
 
-        self.attn = Attention(c, attn_ratio=attn_ratio, num_heads=num_heads)
+        self.attn = DPUAttention(c, num_heads=num_heads, attn_ratio=attn_ratio) 
         self.ffn = nn.Sequential(Conv(c, c * 2, 1), Conv(c * 2, c, 1, act=False))
         self.add = shortcut
 
@@ -1469,8 +1518,9 @@ class C2PSA(nn.Module):
         super().__init__()
         assert c1 == c2
         self.c = int(c1 * e)
-        self.cv1 = Conv(c1, 2 * self.c, 1, 1)
-        self.cv2 = Conv(2 * self.c, c1, 1)
+        self.cv1a = Conv(c1, self.c, 1, 1)
+        self.cv1b = Conv(c1, self.c, 1, 1)
+        self.cv2 = Conv(2 * self.c, c2, 1)
 
         self.m = nn.Sequential(*(PSABlock(self.c, attn_ratio=0.5, num_heads=self.c // 64) for _ in range(n)))
 
@@ -1483,7 +1533,9 @@ class C2PSA(nn.Module):
         Returns:
             (torch.Tensor): Output tensor after processing.
         """
-        a, b = self.cv1(x).split((self.c, self.c), dim=1)
+        #a, b = self.cv1(x).split((self.c, self.c), dim=1)
+        a = self.cv1a(x)
+        b = self.cv1b(x)
         b = self.m(b)
         return self.cv2(torch.cat((a, b), 1))
 

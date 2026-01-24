@@ -22,7 +22,7 @@ def export_fused(input_weights, output_weights):
 
 if __name__ == "__main__":
     # Update these paths to match your training result
-    INPUT = "/home/choneil/ultralytics/runs/detect/train13/weights/best.pt"
-    OUTPUT = "best_fused.pt"
+    INPUT = "./weights/yolo11/tuned/unfused/11nunfused.pt"
+    OUTPUT = "./weights/yolo11/tuned/fused/yolo11n_zcu102.pt"
     
     export_fused(INPUT, OUTPUT)
