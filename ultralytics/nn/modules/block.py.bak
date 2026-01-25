@@ -1266,97 +1266,100 @@ class C2fCIB(C2f):
         super().__init__(c1, c2, n, shortcut, g, e)
         self.m = nn.ModuleList(CIB(self.c, self.c, shortcut, e=1.0, lk=lk) for _ in range(n))
 
+
 class DPUAttention(nn.Module):
-    """DPU-compatible attention: LKA spatial + SE channel."""
+    """DPU-compatible attention using large kernel depthwise convolutions.
     
+    Replaces self-attention (Q@K@V) with spatial attention via:
+    - Depthwise conv for local context (5x5)
+    - Dilated depthwise conv for global context (7x7, dilation=3 → 19x19 effective RF)
+    - Pointwise conv for channel mixing
+    - Hardsigmoid gating
+    
+    All ops are DPU-compatible: depthwiseconv2d, conv2d, eltwise prod.
+    """
+
     def __init__(self, dim, num_heads=8, attn_ratio=0.5):
         super().__init__()
-        reduction = 4  # SE bottleneck ratio
+        # Keep signature compatible with original Attention
+        # num_heads and attn_ratio ignored but kept for API compatibility
         
-        # === Spatial attention (LKA-style) ===
+        # Local context: 5x5 depthwise conv
         self.dw_local = Conv(dim, dim, 5, g=dim, act=False)
-        self.dw_dilated = nn.Conv2d(dim, dim, 7, padding=9, dilation=3, groups=dim, bias=False)
-        self.bn_spatial = nn.BatchNorm2d(dim)
+        
+        # Global context: 7x7 dilated depthwise conv (effective 19x19 receptive field)
+        self.dw_global = nn.Conv2d(dim, dim, 7, padding=9, dilation=3, groups=dim, bias=False)
+        self.bn = nn.BatchNorm2d(dim)
+        
+        # Channel mixing: 1x1 pointwise conv
         self.pw = Conv(dim, dim, 1, act=False)
         
-        # === Channel attention (SE-style) ===
-        self.gap = nn.AdaptiveAvgPool2d(1)
-        self.fc1 = nn.Conv2d(dim, dim // reduction, 1)
-        self.fc2 = nn.Conv2d(dim // reduction, dim, 1)
-        
-        # Activations
+        # Gating activation (DPU-supported)
         self.act = nn.Hardsigmoid()
-        self.relu = nn.ReLU()
         
-        # Positional encoding
+        # Positional encoding (keep from original)
         self.pe = Conv(dim, dim, 3, 1, g=dim, act=False)
-    
+
     def forward(self, x):
-        # Spatial attention (local + mid-range context)
-        sa = self.dw_local(x)
-        sa = self.bn_spatial(self.dw_dilated(sa))
-        sa = self.act(self.pw(sa))
+        # Compute attention weights via large kernel convs
+        attn = self.dw_local(x)
+        attn = self.bn(self.dw_global(attn))
+        attn = self.pw(attn)
+        attn = self.act(attn)
         
-        # Channel attention (global context)
-        ca = self.gap(x)
-        ca = self.relu(self.fc1(ca))
-        ca = self.act(self.fc2(ca))  # [B, C, 1, 1]
-        
-        # Apply: spatial then channel (both multiplicative)
-        out = x * sa      # spatial gating
-        out = out * ca    # channel recalibration
+        # Apply attention (eltwise prod - DPU supported)
+        out = x * attn
         
         # Add positional encoding
         out = out + self.pe(x)
+        
         return out
 
 class DPUAAttn(nn.Module):
-    """DPU-compatible attention: LKA spatial + SE channel.
-    
-    Replaces self-attention with:
-    - Spatial attention via LKA (local + dilated depthwise)
-    - Channel attention via SE (GAP + bottleneck FC)
-    - Positional encoding via depthwise conv
+    """DPU-compatible attention using large kernel depthwise convolutions.
+
+    Replaces self-attention (Q@K@V) with spatial attention via:
+    - Depthwise conv for local context (5x5)
+    - Dilated depthwise conv for global context (7x7, dilation=3 → 19x19 effective RF)
+    - Pointwise conv for channel mixing
+    - Hardsigmoid gating
+
+    All ops are DPU-compatible: depthwiseconv2d, conv2d, eltwise prod.
     """
-    
+
     def __init__(self, dim, num_heads=8, area=1):
         super().__init__()
-        reduction = 4  # SE bottleneck ratio
-        
-        # === Spatial attention (LKA-style) ===
+        # Keep signature compatible with original Attention
+        # num_heads and attn_ratio ignored but kept for API compatibility
+       # dilation = max(1,4//area)
+       # padding = dilation*3
+        # Local context: 5x5 depthwise conv
         self.dw_local = Conv(dim, dim, 5, g=dim, act=False)
-        self.dw_dilated = nn.Conv2d(dim, dim, 7, padding=9, dilation=3, groups=dim, bias=False)
-        self.bn_spatial = nn.BatchNorm2d(dim)
+        
+        # Global context: 7x7 dilated depthwise conv (effective 19x19 receptive field)
+        self.dw_global = nn.Conv2d(dim, dim, 7, padding=9, dilation=3, groups=dim, bias=False)
+        self.bn = nn.BatchNorm2d(dim)
+
+        # Channel mixing: 1x1 pointwise conv
         self.pw = Conv(dim, dim, 1, act=False)
-        
-        # === Channel attention (SE-style with true global context) ===
-        self.gap = nn.AdaptiveAvgPool2d(1)
-        self.fc1 = nn.Conv2d(dim, dim // reduction, 1)
-        self.fc2 = nn.Conv2d(dim // reduction, dim, 1)
-        
-        # Activations
+
+        # Gating activation (DPU-supported)
         self.act = nn.Hardsigmoid()
-        self.relu = nn.ReLU()
-        
-        # Positional encoding (7x7 depthwise)
+
+        # Positional encoding (keep from original)
         self.pe = Conv(dim, dim, 7, 1, 3, g=dim, act=False)
-    
+
     def forward(self, x):
-        # Spatial attention
-        sa = self.dw_local(x)
-        sa = self.bn_spatial(self.dw_dilated(sa))
-        sa = self.act(self.pw(sa))
-        
-        # Channel attention (true global context)
-        ca = self.gap(x)
-        ca = self.relu(self.fc1(ca))
-        ca = self.act(self.fc2(ca))
-        
-        # Apply both (multiplicative)
-        out = x * sa
-        out = out * ca
-        
-        # Positional encoding
+        # Compute attention weights via large kernel convs
+        attn = self.dw_local(x)
+        attn = self.bn(self.dw_global(attn))
+        attn = self.pw(attn)
+        attn = self.act(attn)
+
+        # Apply attention (eltwise prod - DPU supported)
+        out = x * attn
+
+        # Add positional encoding
         out = out + self.pe(x)
         return out
 

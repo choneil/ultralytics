@@ -1,5 +1,7 @@
 from ultralytics import YOLO
 import torch
+import argparse
+import os
 
 def export_fused(input_weights, output_weights):
     print(f"Loading un-fused model: {input_weights}")
@@ -15,14 +17,20 @@ def export_fused(input_weights, output_weights):
     
     # 3. Save as a standard PyTorch checkpoint
     # This file will have NO 'bn' layers; they are baked into the 'conv' weights.
+    os.makedirs(os.path.dirname(output_weights), exist_ok=True)
     print(f"Saving fused model to: {output_weights}")
     torch.save(fused_model.state_dict(), output_weights)
     
     print("✅ Done! You can now load this .pt directly into vai_q_pytorch.")
 
 if __name__ == "__main__":
-    # Update these paths to match your training result
-    INPUT = "./weights/yolo11/tuned/unfused/11nunfused.pt"
-    OUTPUT = "./weights/yolo11/tuned/fused/yolo11n_zcu102.pt"
+    parser = argparse.ArgumentParser(description="Fuse BatchNorm into Conv layers")
+    parser.add_argument("input", help="Path to unfused .pt weights")
+    args = parser.parse_args()
     
-    export_fused(INPUT, OUTPUT)
+    input_dir = os.path.dirname(args.input)
+    parent_dir = os.path.dirname(input_dir)
+    filename = os.path.basename(args.input).replace("unfused", "fused")
+    output = os.path.join(parent_dir, "fused", filename)
+    
+    export_fused(args.input, output)
